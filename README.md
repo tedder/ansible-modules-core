@@ -28,3 +28,4 @@ Installation
 ============
 
 There should be no need to install this repo separately as it should be included in any Ansible install using the official documented methods.
+
