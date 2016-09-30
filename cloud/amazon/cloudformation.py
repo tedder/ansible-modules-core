@@ -145,16 +145,22 @@ EXAMPLES = '''
       Stack: ansible-cloudformation
 '''
 
-import json
+#import json
 import time
-import yaml
+#import yaml
+
+# import module snippets
+from ansible.module_utils.basic import AnsibleModule
+from ansible.module_utils.ec2 import ec2_argument_spec
+import ansible.module_utils.ec2
 
 try:
-    import boto
-    import boto.cloudformation.connection
-    HAS_BOTO = True
+    import boto3
+    import botocore
+    #import boto.cloudformation.connection
+    HAS_BOTO3 = True
 except ImportError:
-    HAS_BOTO = False
+    HAS_BOTO3 = False
 
 
 def boto_exception(err):
@@ -170,7 +176,7 @@ def boto_exception(err):
 
 
 def boto_version_required(version_tuple):
-    parts = boto.Version.split('.')
+    parts = boto3.__version__.split('.')
     boto_version = []
     try:
         for part in parts:
@@ -179,59 +185,91 @@ def boto_version_required(version_tuple):
         boto_version.append(-1)
     return tuple(boto_version) >= tuple(version_tuple)
 
+def get_stack_events(cfn, stack_name):
+    '''This event data was never correct, it worked as a side effect. So the v2.3 format is different.'''
+    ret = { 'events':[], 'fails':[] }
+
+    events = cfn.describe_stack_events(StackName=stack_name)
+    for e in events.get('StackEvents', []):
+        eventline = 'StackEvent {} {} {}'.format(e['ResourceType'], e['LogicalResourceId'], e['ResourceStatus'])
+        ret['events'].append(eventline)
+
+        if e['ResourceStatus'].endswith('FAILED'):
+            failline = '{} {} {}: {}'.format(e['ResourceType'], e['LogicalResourceId'], e['ResourceStatus'], e['ResourceStatusReason'])
+            ret['fails'].append(failline)
+
+#LogicalResourceId PhysicalResourceId ResourceType ResourceStatus ResourceStatusReason
+    return ret
 
 def stack_operation(cfn, stack_name, operation):
     '''gets the status of a stack while it is created/updated/deleted'''
     existed = []
-    result = {}
     operation_complete = False
     while operation_complete == False:
         try:
-            stack = invoke_with_throttling_retries(cfn.describe_stacks, stack_name)[0]
+            stack = get_stack_facts(cfn, stack_name)
             existed.append('yes')
         except:
             if 'yes' in existed:
-                result = dict(changed=True,
-                              output='Stack Deleted',
-                              events=list(map(str, list(stack.describe_events()))))
+                ret = get_stack_events(cfn, stack_name)
+                ret.update({ 'changed': True, 'output': 'Stack Deleted'})
+                return ret
             else:
-                result = dict(changed= True, output='Stack Not Found')
-            break
-        if '%s_COMPLETE' % operation == stack.stack_status:
-            result = dict(changed=True,
-                          events = list(map(str, list(stack.describe_events()))),
-                          output = 'Stack %s complete' % operation)
-            break
-        if  'ROLLBACK_COMPLETE' == stack.stack_status or '%s_ROLLBACK_COMPLETE' % operation == stack.stack_status:
-            result = dict(changed=True, failed=True,
-                          events = list(map(str, list(stack.describe_events()))),
-                          output = 'Problem with %s. Rollback complete' % operation)
-            break
-        elif '%s_FAILED' % operation == stack.stack_status:
-            result = dict(changed=True, failed=True,
-                          events = list(map(str, list(stack.describe_events()))),
-                          output = 'Stack %s failed' % operation)
-            break
-        elif '%s_ROLLBACK_FAILED' % operation == stack.stack_status:
-            result = dict(changed=True, failed=True,
-                          events = list(map(str, list(stack.describe_events()))),
-                          output = 'Stack %s rollback failed' % operation)
-            break
+                return dict(changed= True, output='Stack Not Found')
+        ret = get_stack_events(cfn, stack_name)
+        if stack['StackStatus'].endswith('_ROLLBACK_COMPLETE'):
+            ret.update({'changed':True, 'failed':True, 'output' : 'Problem with %s. Rollback complete' % operation})
+            return ret
+        # note the ordering of ROLLBACK_COMPLETE and COMPLETE, because otherwise COMPLETE will match both cases.
+        elif stack['StackStatus'].endswith('_COMPLETE'):
+            ret.update({'changed':True, 'output' : 'Stack %s complete' % operation })
+            return ret
+        elif stack['StackStatus'].endswith('_ROLLBACK_FAILED'):
+            ret.update({'changed':True, 'failed':True, 'output' : 'Stack %s rollback failed' % operation})
+            return ret
+        # note the ordering of ROLLBACK_FAILED and FAILED, because otherwise FAILED will match both cases.
+        elif stack['StackStatus'].endswith('_FAILED'):
+            ret.update({'changed':True, 'failed':True, 'output': 'Stack %s failed' % operation})
+            return ret
         else:
+            # this can loop forever :/
+            #return dict(changed=True, failed=True, output = str(stack), operation=operation)
             time.sleep(5)
-    return result
+    return {'failed': True, 'output':'Failed for unknown reasons.'}
+
+def get_stack_facts(cfn, stack_name):
+    try:
+        stack_response = invoke_with_throttling_retries(cfn.describe_stacks,StackName=stack_name)
+        stack_info = stack_response['Stacks'][0]
+    #except AmazonCloudFormationException as e:
+    except botocore.exceptions.ClientError as err:
+        error_msg = boto_exception(err)
+        if 'Stack with id {} does not exist'.format(stack_name) in error_msg:
+            # missing stack, don't bail.
+            return None
+
+        # other error, bail.
+        raise err
+
+    if stack_response and stack_response.get('Stacks', None):
+        stacks = stack_response['Stacks']
+        if len(stacks):
+            stack_info = stacks[0]
+
+    return stack_info
 
 IGNORE_CODE = 'Throttling'
 MAX_RETRIES=3
-def invoke_with_throttling_retries(function_ref, *argv):
+def invoke_with_throttling_retries(function_ref, *argv, **kwargs):
     retries=0
     while True:
         try:
-            retval=function_ref(*argv)
+            retval=function_ref(*argv, **kwargs)
             return retval
-        except boto.exception.BotoServerError as e:
-            if e.code != IGNORE_CODE or retries==MAX_RETRIES:
-                raise e
+        #except boto.exception.BotoServerError as e:
+        except Exception as e:
+            #if e.code != IGNORE_CODE or retries==MAX_RETRIES:
+            raise e
         time.sleep(5 * (2**retries))
         retries += 1
 
@@ -255,123 +293,116 @@ def main():
         argument_spec=argument_spec,
         mutually_exclusive=[['template_url', 'template']],
     )
-    if not HAS_BOTO:
-        module.fail_json(msg='boto required for this module')
+    if not HAS_BOTO3:
+        module.fail_json(msg='boto3 required for this module')
 
+    # collect the parameters that are passed to boto3. Keeps us from having so many scalars floating around.
+    stack_params = {
+      'Capabilities':['CAPABILITY_IAM', 'CAPABILITY_NAMED_IAM'],
+    }
     state = module.params['state']
-    stack_name = module.params['stack_name']
+    stack_params['StackName'] = module.params['stack_name']
 
     if module.params['template'] is None and module.params['template_url'] is None:
         if state == 'present':
-            module.fail_json('Module parameter "template" or "template_url" is required if "state" is "present"')
+            module.fail_json(msg='Module parameter "template" or "template_url" is required if "state" is "present"')
 
     if module.params['template'] is not None:
-        template_body = open(module.params['template'], 'r').read()
-    else:
-        template_body = None
+        stack_params['TemplateBody'] = open(module.params['template'], 'r').read()
 
-    if module.params['template_format'] == 'yaml':
-        if template_body is None:
-            module.fail_json(msg='yaml format only supported for local templates')
-        else:
-            template_body = json.dumps(yaml.load(template_body), indent=2)
+    # um, skip this for now.
+    #if module.params['template_format'] == 'yaml':
+    #    if template_body is None:
+    #        module.fail_json(msg='yaml format only supported for local templates')
+    #    else:
+    #        template_body = json.dumps(yaml.load(template_body), indent=2)
 
-    notification_arns = module.params['notification_arns']
+    if module.params.get('notification_arns'):
+        stack_params['NotificationARNs'] = module.params['notification_arns']
 
     if module.params['stack_policy'] is not None:
-        stack_policy_body = open(module.params['stack_policy'], 'r').read()
-    else:
-        stack_policy_body = None
+        stack_params['StackPolicyBody'] = open(module.params['stack_policy'], 'r').read()
 
-    disable_rollback = module.params['disable_rollback']
+    #stack_params['DisableRollback'] = module.params['disable_rollback']
+
     template_parameters = module.params['template_parameters']
-    tags = module.params['tags']
-    template_url = module.params['template_url']
+    stack_params['Parameters'] = [{'ParameterKey':k, 'ParameterValue':v} for k, v in template_parameters.items()]
 
-    region, ec2_url, aws_connect_kwargs = get_aws_connection_info(module)
+    if module.params.get('tags'):
+        stack_params['Tags'] = [{k:v} for k,v in module.params['tags']]
+    if module.params.get('template_url'):
+        stack_params['TemplateURL'] = module.params['template_url']
 
-    kwargs = dict()
-    if tags is not None:
-        if not boto_version_required((2,6,0)):
-            module.fail_json(msg='Module parameter "tags" requires at least Boto version 2.6.0')
-        kwargs['tags'] = tags
+    #kwargs = dict()
+    #if tags is not None:
+    #    if not boto_version_required((2,6,0)):
+    #        module.fail_json(msg='Module parameter "tags" requires at least Boto version 2.6.0')
+    #    kwargs['tags'] = tags
 
 
     # convert the template parameters ansible passes into a tuple for boto
-    template_parameters_tup = [(k, v) for k, v in template_parameters.items()]
-    stack_outputs = {}
+    #stack_outputs = {}
 
     try:
-        cfn = connect_to_aws(boto.cloudformation, region, **aws_connect_kwargs)
-    except boto.exception.NoAuthHandlerFound as e:
+        region, ec2_url, aws_connect_kwargs = ansible.module_utils.ec2.get_aws_connection_info(module, boto3=True)
+        cfn = ansible.module_utils.ec2.boto3_conn(module, conn_type='client', resource='cloudformation', region=region, endpoint=ec2_url, **aws_connect_kwargs)
+    except botocore.exceptions.NoCredentialsError as e:
         module.fail_json(msg=str(e))
     update = False
     result = {}
-    operation = None
+
+    stack_info = get_stack_facts(cfn, stack_params['StackName'])
+    #module.fail_json(msg=stack_info.get('error'))
+    #module.fail_json(msg=type(stack_info['exc']))
+
 
     # if state is present we are going to ensure that the stack is either
     # created or updated
-    if state == 'present':
+    if state == 'present' and not stack_info:
         try:
-            cfn.create_stack(stack_name, parameters=template_parameters_tup,
-                             template_body=template_body,
-                             notification_arns=notification_arns,
-                             stack_policy_body=stack_policy_body,
-                             template_url=template_url,
-                             disable_rollback=disable_rollback,
-                             capabilities=['CAPABILITY_IAM', 'CAPABILITY_NAMED_IAM'],
-                             **kwargs)
-            operation = 'CREATE'
+            cfn.create_stack(**stack_params)
         except Exception as err:
             error_msg = boto_exception(err)
-            if 'AlreadyExistsException' in error_msg or 'already exists' in error_msg:
-                update = True
-            else:
-                module.fail_json(msg=error_msg)
-        if not update:
-            result = stack_operation(cfn, stack_name, operation)
+            #return {'error': error_msg}
+            module.fail_json(msg=error_msg)
+        result = stack_operation(cfn, stack_params['StackName'], 'CREATE')
+        if not result: module.fail_json(msg="empty result 1")
 
-    # if the state is present and the stack already exists, we try to update it
-    # AWS will tell us if the stack template and parameters are the same and
-    # don't need to be updated.
-    if update:
+    if state == 'present' and stack_info:
+        # if the state is present and the stack already exists, we try to update it.
+        # AWS will tell us if the stack template and parameters are the same and
+        # don't need to be updated.
         try:
-            cfn.update_stack(stack_name, parameters=template_parameters_tup,
-                             template_body=template_body,
-                             notification_arns=notification_arns,
-                             stack_policy_body=stack_policy_body,
-                             disable_rollback=disable_rollback,
-                             template_url=template_url,
-                             capabilities=['CAPABILITY_IAM', 'CAPABILITY_NAMED_IAM'],
-                             **kwargs)
-            operation = 'UPDATE'
+            cfn.update_stack(**stack_params)
         except Exception as err:
             error_msg = boto_exception(err)
             if 'No updates are to be performed.' in error_msg:
                 result = dict(changed=False, output='Stack is already up-to-date.')
             else:
                 module.fail_json(msg=error_msg)
-
-        if operation == 'UPDATE':
-            result = stack_operation(cfn, stack_name, operation)
+                #return {'error': error_msg}
+                #module.fail_json(msg=error_msg)
+        result = stack_operation(cfn, stack_params['StackName'], 'UPDATE')
+        if not result: module.fail_json(msg="empty result 2")
 
     # check the status of the stack while we are creating/updating it.
     # and get the outputs of the stack
 
     if state == 'present' or update:
-        stack = invoke_with_throttling_retries(cfn.describe_stacks,stack_name)[0]
-        for output in stack.outputs:
-            stack_outputs[output.key] = output.value
-        result['stack_outputs'] = stack_outputs
+        stack = get_stack_facts(cfn, stack_params['StackName'])
+        for output in stack.get('Outputs', []):
+            result['stack_outputs'][output['OutputKey']] = output['OutputValue']
         stack_resources = [] 
-        for res in cfn.list_stack_resources(stack_name):
+        reslist = cfn.list_stack_resources(StackName=stack_params['StackName'])
+        for res in reslist.get('StackResourceSummaries', []):
             stack_resources.append({
-                "last_updated_time": res.last_updated_time,
-                "logical_resource_id": res.logical_resource_id,
-                "physical_resource_id": res.physical_resource_id,
-                "status": res.resource_status,
-                "status_reason": res.resource_status_reason,
-                "resource_type": res.resource_type })
+                "logical_resource_id": res['LogicalResourceId'],
+                "physical_resource_id": res['PhysicalResourceId'],
+                "resource_type": res['ResourceType'],
+                "last_updated_time": res['LastUpdatedTimestamp'],
+                "status": res['ResourceStatus'],
+                "status_reason": res.get('ResourceStatusReason') # can be blank, apparently
+            })
         result['stack_resources'] = stack_resources
 
     # absent state is different because of the way delete_stack works.
@@ -380,23 +411,17 @@ def main():
 
     if state == 'absent':
         try:
-            invoke_with_throttling_retries(cfn.describe_stacks,stack_name)
-            operation = 'DELETE'
+            stack = get_stack_facts()
+            if not stack:
+                result = dict(changed=False, output='Stack not found.')
         except Exception as err:
             error_msg = boto_exception(err)
-            if 'Stack:%s does not exist' % stack_name in error_msg:
-                result = dict(changed=False, output='Stack not found.')
-            else:
-                module.fail_json(msg=error_msg)
-        if operation == 'DELETE':
-            cfn.delete_stack(stack_name)
-            result = stack_operation(cfn, stack_name, operation)
+            module.fail_json(msg=error_msg)
+            cfn.delete_stack(stack_params['StackName'])
+            result = stack_operation(cfn, stack_params['StackName'], 'DELETE')
 
     module.exit_json(**result)
 
-# import module snippets
-from ansible.module_utils.basic import AnsibleModule
-from ansible.module_utils.ec2 import ec2_argument_spec, get_aws_connection_info, connect_to_aws
 
 if __name__ == '__main__':
     main()
