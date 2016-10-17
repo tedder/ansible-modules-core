@@ -390,7 +390,7 @@ def main():
         region, ec2_url, aws_connect_kwargs = ansible.module_utils.ec2.get_aws_connection_info(module, boto3=True)
         cfn = ansible.module_utils.ec2.boto3_conn(module, conn_type='client', resource='cloudformation', region=region, endpoint=ec2_url, **aws_connect_kwargs)
     except botocore.exceptions.NoCredentialsError as e:
-        module.fail_json(msg=str(e))
+        module.fail_json(msg=boto_exception(e))
 
     stack_info = get_stack_facts(cfn, stack_params['StackName'])
 
@@ -460,9 +460,7 @@ def main():
                 cfn.delete_stack(StackName=stack_params['StackName'])
                 result = stack_operation(cfn, stack_params['StackName'], 'DELETE')
         except Exception as err:
-            ei = sys.exc_info()
-            error_msg = boto_exception(err)
-            module.fail_json(msg=error_msg + ' ' + str(traceback.format_exception(*ei)))
+            module.fail_json(msg=boto_exception(err), exception=traceback.format_exc())
 
     module.exit_json(**result)
 
