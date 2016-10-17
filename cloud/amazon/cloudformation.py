@@ -183,14 +183,6 @@ import yaml
 import sys
 import traceback
 
-# import module snippets
-from ansible.module_utils.basic import AnsibleModule
-from ansible.module_utils.ec2 import ec2_argument_spec
-
-# import a class, otherwise we'll use a fully qualified path
-from ansible.module_utils.ec2 import AWSRetry
-import ansible.module_utils.ec2
-
 
 try:
     import boto3
@@ -332,7 +324,7 @@ def invoke_with_throttling_retries(function_ref, *argv, **kwargs):
         retries += 1
 
 def main():
-    argument_spec = ec2_argument_spec()
+    argument_spec = ansible.module_utils.ec2.ec2_argument_spec()
     argument_spec.update(dict(
             stack_name=dict(required=True),
             template_parameters=dict(required=False, type='dict', default={}),
@@ -474,6 +466,13 @@ def main():
 
     module.exit_json(**result)
 
+
+# import module snippets
+from ansible.module_utils.basic import AnsibleModule
+import ansible.module_utils.ec2
+
+# import a class, otherwise we'll use a fully qualified path
+from ansible.module_utils.ec2 import AWSRetry
 
 if __name__ == '__main__':
     main()
