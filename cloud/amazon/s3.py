@@ -248,7 +248,7 @@ EXAMPLES = '''
 '''
 
 import os
-import urlparse
+from six.moves.urllib.parse import urlparse
 from ssl import SSLError
 
 try:
